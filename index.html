@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF OCR</title>
+<meta name="description" content="Make scanned PDFs searchable. Runs in your browser, files never leave your computer.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='5' y='2' width='22' height='28' rx='3' fill='%232f6fdb'/%3E%3Cpath d='M10 10h12M10 15h12M10 20h8' stroke='white' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+<script src="coi-serviceworker.min.js"></script>
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<main>
+  <header>
+    <h1>PDF OCR</h1>
+    <p class="lede">Drop in a scanned PDF and get the same PDF back with every word searchable and selectable.
+      Everything runs inside your browser. Your files are never uploaded anywhere.</p>
+  </header>
+
+  <section class="options" aria-label="Options">
+    <div class="row">
+      <label for="dpi">Scan resolution</label>
+      <select id="dpi">
+        <option value="200">200 dpi, fastest</option>
+        <option value="300" selected>300 dpi, recommended</option>
+        <option value="400">400 dpi, small text</option>
+      </select>
+    </div>
+    <label class="check"><input type="checkbox" id="skip" checked>
+      Skip pages that are already fully searchable</label>
+  </section>
+
+  <div id="drop" class="drop" tabindex="0" role="button" aria-label="Choose PDF files">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0-4 4m4-4 4 4M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <p><strong>Drop PDFs here</strong> or click to choose</p>
+    <input type="file" id="file" accept="application/pdf,.pdf" multiple hidden>
+  </div>
+
+  <ol id="jobs" class="jobs"></ol>
+
+  <footer>
+    <p>OCR by PaddleOCR PP-OCRv5 running on ONNX Runtime Web. The first run downloads about 30 MB of engine and model files, after that your browser caches them.</p>
+  </footer>
+</main>
+</body>
+</html>
