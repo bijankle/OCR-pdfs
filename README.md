@@ -46,6 +46,7 @@ PP-OCRv6 medium model was also tried. It was 6 times slower and mixed up O and
 |---|---|
 | `index.html`, `style.css`, `app.js` | The page, PDF handling and text layer writing |
 | `paddle.js` | The PaddleOCR pipeline (detection, orientation, recognition) |
+| `ocr-worker.js` | Runs the pipeline in a background thread so the page never freezes |
 | `models/` | PP-OCRv5 mobile detection, English PP-OCRv5 mobile recognition, text line orientation model |
 | `vendor/` | ONNX Runtime Web, pdf.js (legacy build for older browsers), pdf-lib |
 | `coi-serviceworker.min.js` | Lets GitHub Pages run the engine on all CPU cores |

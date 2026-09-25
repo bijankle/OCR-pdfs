@@ -28,13 +28,41 @@ export async function createEngine(setName = 'fast', { onStatus = () => {}, prov
   const set = typeof setName === 'string' ? MODEL_SETS[setName] : setName;
   const ep = providers || ['wasm'];
   const opts = { executionProviders: ep, graphOptimizationLevel: 'all' };
-  onStatus('Loading OCR models');
-  const [det, rec, cls, dictText] = await Promise.all([
-    ort.InferenceSession.create(MODELS + set.det, opts),
-    ort.InferenceSession.create(MODELS + set.rec, opts),
-    ort.InferenceSession.create(MODELS + (set.cls || 'PP-LCNet_x0_25_textline_ori.onnx'), opts),
+  // Download the models ourselves so progress can be shown (cached after the first visit).
+  const WASM = new URL('./vendor/ort/ort-wasm-simd-threaded.wasm', import.meta.url).href;
+  const files = [MODELS + set.det, MODELS + set.rec, MODELS + (set.cls || 'PP-LCNet_x0_25_textline_ori.onnx'), WASM];
+  const got = files.map(() => 0), total = files.map(() => 0);
+  const report = () => {
+    const t = total.reduce((a, b) => a + b, 0);
+    onStatus('Downloading OCR engine', t ? got.reduce((a, b) => a + b, 0) / t : 0);
+  };
+  // Content-Length can be the compressed size, so it only drives the progress figure.
+  const download = async (name, i) => {
+    const res = await fetch(name);
+    if (!res.ok) throw new Error(`Could not download ${name.split('/').pop()} (${res.status})`);
+    total[i] = +res.headers.get('Content-Length') || 0;
+    if (!res.body) return new Uint8Array(await res.arrayBuffer());
+    const chunks = [];
+    const reader = res.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      got[i] = Math.min(total[i], got[i] + value.length);
+      report();
+    }
+    got[i] = total[i];
+    return new Uint8Array(await new Blob(chunks).arrayBuffer());
+  };
+  const [detBytes, recBytes, clsBytes, wasmBytes, dictText] = await Promise.all([
+    ...files.map(download),
     fetch(MODELS + set.dict).then(r => { if (!r.ok) throw new Error('dictionary ' + r.status); return r.text(); }),
   ]);
+  ort.env.wasm.wasmBinary = wasmBytes.buffer;
+  onStatus('Starting OCR engine', 1);
+  const det = await ort.InferenceSession.create(detBytes, opts);
+  const rec = await ort.InferenceSession.create(recBytes, opts);
+  const cls = await ort.InferenceSession.create(clsBytes, opts);
   // Index 0 is the CTC blank. Some models add a space after the dictionary,
   // which recognize() appends once it sees the model's class count.
   const dict = [''].concat(dictText.replace(/\r/g, '').split('\n').filter(c => c !== ''));
@@ -197,12 +225,12 @@ async function detectTile(engine, src, sx, sy, sw, sh, scale) {
 }
 
 // Detect lines on the whole source, tiling when it is larger than the model limit.
-async function detect(engine, src, SW, SH, detScale) {
+async function detect(engine, src, SW, SH, detScale, report = () => {}) {
   const maxSrc = DET.maxSide / detScale;
   const ov = DET.overlap / detScale;
   const nx = SW <= maxSrc ? 1 : Math.ceil((SW - ov) / (maxSrc - ov));
   const ny = SH <= maxSrc ? 1 : Math.ceil((SH - ov) / (maxSrc - ov));
-  if (nx === 1 && ny === 1) return detectTile(engine, src, 0, 0, SW, SH, detScale);
+  if (nx === 1 && ny === 1) { const r = await detectTile(engine, src, 0, 0, SW, SH, detScale); report(1); return r; }
 
   const tw = Math.ceil((SW + (nx - 1) * ov) / nx), th = Math.ceil((SH + (ny - 1) * ov) / ny);
   const whole = [], cut = [];
@@ -210,6 +238,7 @@ async function detect(engine, src, SW, SH, detScale) {
     for (let ix = 0; ix < nx; ix++) {
       const x0 = Math.min(SW - tw, ix * (tw - ov)), y0 = Math.min(SH - th, iy * (th - ov));
       const rects = await detectTile(engine, src, x0, y0, tw, th, detScale);
+      report((iy * nx + ix + 1) / (nx * ny));
       const edge = 3 / detScale;
       for (const r of rects) {
         const b = aabb(r);
@@ -294,7 +323,7 @@ function upright(r) {
 }
 const flip = (r) => ({ ...r, ex: [-r.ex[0], -r.ex[1]], ey: [-r.ey[0], -r.ey[1]] });
 
-async function classify(engine, src, rects) {
+async function classify(engine, src, rects, report = () => {}) {
   const W = 160, H = 80, B = 16;
   for (let s = 0; s < rects.length; s += B) {
     const part = rects.slice(s, s + B);
@@ -303,6 +332,7 @@ async function classify(engine, src, rects) {
     const res = await engine.cls.run({ [engine.cls.inputNames[0]]: new ort.Tensor('float32', data, [part.length, 3, H, W]) });
     const p = res[engine.cls.outputNames[0]].data;
     part.forEach((r, i) => { if (p[i * 2 + 1] > 0.9) rects[s + i] = flip(r); });
+    report(Math.min(1, (s + B) / rects.length));
   }
   return rects;
 }
@@ -325,7 +355,7 @@ function decode(probs, T, C, dict) {
   return { chars, conf: chars.length ? confSum / chars.length : 0 };
 }
 
-async function recognize(engine, src, rects) {
+async function recognize(engine, src, rects, report = () => {}) {
   const H = REC.height;
   const items = rects.map((r, idx) => ({ r, idx, W: Math.min(REC.maxWidth, Math.max(16, Math.round(H * r.w / r.h))) }));
   items.sort((a, b) => a.W - b.W);
@@ -343,6 +373,7 @@ async function recognize(engine, src, rects) {
       const d = decode(out.data.subarray(i * T * C, (i + 1) * T * C), T, C, engine.dict);
       results[p.idx] = { ...d, stepPx: Wp / T, W: p.W };
     });
+    report(Math.min(1, (s + REC.batch) / items.length));
   }
   return results;
 }
@@ -372,14 +403,15 @@ function toWords(line) {
 // Returns lines: { text, conf, rect, words: [{ text, a, b, size }] } where a and b
 // are the start and end of the word baseline in source pixels and size is the
 // text height in source pixels.
-export async function recognizePage(engine, src, { detScale = 0.5, minConf = 0.5 } = {}) {
+// onProgress(fraction, stage) is called as the page moves through the stages.
+export async function recognizePage(engine, src, { detScale = 0.5, minConf = 0.5, onProgress = () => {} } = {}) {
   const SW = src.width, SH = src.height;
   const t0 = performance.now();
-  let rects = (await detect(engine, src, SW, SH, detScale)).map(upright);
+  let rects = (await detect(engine, src, SW, SH, detScale, f => onProgress(0.55 * f, 'Finding text'))).map(upright);
   const t1 = performance.now();
-  rects = await classify(engine, src, rects);
+  rects = await classify(engine, src, rects, f => onProgress(0.55 + 0.05 * f, 'Finding text'));
   const t2 = performance.now();
-  const recs = await recognize(engine, src, rects);
+  const recs = await recognize(engine, src, rects, f => onProgress(0.6 + 0.4 * f, 'Reading text'));
   const t3 = performance.now();
   engine.lastTiming = { detect: t1 - t0, classify: t2 - t1, recognize: t3 - t2, lines: rects.length, size: [SW, SH] };
   const lines = [];

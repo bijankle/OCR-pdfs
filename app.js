@@ -9,7 +9,6 @@ import {
   pushGraphicsState, popGraphicsState, beginText, endText,
   setFontAndSize, setTextRenderingMode, setTextMatrix, setCharacterSqueeze, showText,
 } from './vendor/pdf-lib/pdf-lib.esm.min.js';
-import { createEngine, recognizePage } from './paddle.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('./vendor/pdfjs/pdf.worker.min.mjs', import.meta.url).href;
 
@@ -23,13 +22,28 @@ const DET_SCALE = 0.67;
 // Characters the standard PDF font cannot hold, mapped to near equivalents.
 const SUBST = { '\u2300': '\u00d8', '\u2212': '-', '\u2010': '-', '\u2011': '-', '\u2013': '-', '\u2014': '-', '\u2018': "'", '\u2019': "'", '\u201c': '"', '\u201d': '"' };
 
-let enginePromise = null;
-function getEngine(onStatus) {
-  if (!enginePromise) {
-    enginePromise = createEngine('fast', { onStatus });
-    enginePromise.catch(() => { enginePromise = null; });
+// The OCR engine lives in a Web Worker so the page stays responsive.
+let worker = null, nextId = 0;
+const calls = new Map();
+function callWorker(msg, transfer, onProgress) {
+  if (!worker) {
+    worker = new Worker(new URL('./ocr-worker.js', import.meta.url), { type: 'module' });
+    worker.onmessage = ({ data }) => {
+      const c = calls.get(data.id);
+      if (!c) return;
+      if (data.type === 'progress') c.onProgress && c.onProgress(data.fraction, data.stage);
+      else { calls.delete(data.id); data.type === 'error' ? c.reject(new Error(data.message)) : c.resolve(data); }
+    };
+    worker.onerror = (e) => {
+      for (const c of calls.values()) c.reject(new Error(e.message || 'The OCR engine stopped unexpectedly'));
+      calls.clear(); worker = null;
+    };
   }
-  return enginePromise;
+  const id = ++nextId;
+  return new Promise((resolve, reject) => {
+    calls.set(id, { resolve, reject, onProgress });
+    worker.postMessage({ ...msg, id }, transfer || []);
+  });
 }
 
 // ---------------------------------------------------------------- page work
@@ -109,9 +123,11 @@ async function processFile(file, opts, ui) {
   const pages = out.getPages();
   const n = pdf.numPages;
 
-  const engine = await getEngine(ui.status);
+  // Bar: 0 to 10% starting the engine, 10 to 95% pages, then saving.
+  const bar = (f) => ui.bar(f);
+  await callWorker({ type: 'init' }, [], (f, stage) => { bar(0.1 * f); ui.status(`${stage} ${Math.round(100 * f)}%`); });
+  bar(0.1);
   let done = 0, skipped = 0, wordsTotal = 0;
-  ui.progress(0, n);
 
   // Render the next page while the current one is being read.
   const load = async (i) => {
@@ -120,15 +136,20 @@ async function processFile(file, opts, ui) {
     if (opts.skipText && existing.chars > 300) return { page, skip: true };
     return { page, existing, ...(await renderPage(page, opts.dpi)) };
   };
+  ui.status(`Page 1 of ${n}: preparing`);
   let pending = load(1);
   for (let i = 1; i <= n; i++) {
     const cur = await pending;
     if (i < n) pending = load(i + 1);
-    ui.status(`Reading page ${i} of ${n}`);
+    ui.status(`Page ${i} of ${n}: finding text`);
     if (cur.skip) {
       skipped++;
     } else {
-      const lines = await recognizePage(engine, cur.canvas, { detScale: DET_SCALE });
+      const bitmap = await createImageBitmap(cur.canvas);
+      const { lines } = await callWorker({ type: 'page', bitmap, detScale: DET_SCALE }, [bitmap], (f, stage) => {
+        bar(0.1 + 0.85 * (done + f) / n);
+        ui.status(`Page ${i} of ${n}: ${stage.toLowerCase()} ${Math.round(100 * f)}%`);
+      });
       const pdfPage = pages[i - 1];
       pdfPage.node.normalize();
       const fontKey = pdfPage.node.newFontDictionary(font.name, font.ref);
@@ -140,10 +161,11 @@ async function processFile(file, opts, ui) {
     }
     cur.page.cleanup();
     done++;
-    ui.progress(done, n);
+    bar(0.1 + 0.85 * done / n);
   }
 
   ui.status('Saving');
+  bar(0.97);
   const saved = await out.save({ useObjectStreams: true });
   await pdf.destroy();
   return { blob: new Blob([saved], { type: 'application/pdf' }), pages: n, skipped, words: wordsTotal };
@@ -186,11 +208,15 @@ async function pump() {
     const result = li.querySelector('.result');
     li.classList.add('running');
     const t0 = performance.now();
+    let label = 'Starting';
+    const timer = setInterval(() => { state.textContent = `${label} (${Math.round((performance.now() - t0) / 1000)} s)`; }, 1000);
     try {
       const r = await processFile(file, opts, {
-        status: (s) => { state.textContent = s; },
-        progress: (d, n) => { bar.style.width = `${(100 * d / n).toFixed(1)}%`; },
+        status: (s) => { label = s; state.textContent = `${label} (${Math.round((performance.now() - t0) / 1000)} s)`; },
+        bar: (f) => { bar.style.width = `${(100 * f).toFixed(1)}%`; },
       });
+      clearInterval(timer);
+      bar.style.width = '100%';
       const secs = ((performance.now() - t0) / 1000).toFixed(0);
       const name = file.name.replace(/\.pdf$/i, '') + '_searchable.pdf';
       const url = URL.createObjectURL(r.blob);
@@ -207,12 +233,14 @@ async function pump() {
       li.classList.add('ok');
     } catch (err) {
       console.error(err);
+      clearInterval(timer);
       state.textContent = 'Failed';
       result.textContent = /password/i.test(err && err.message)
         ? 'This PDF is password protected. Remove the password and try again.'
         : `Could not process this file: ${err && err.message ? err.message : err}`;
       li.classList.add('err');
     }
+    clearInterval(timer);
     li.classList.remove('running');
   }
   busy = false;
