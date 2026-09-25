@@ -125,7 +125,8 @@ async function processFile(file, opts, ui) {
 
   // Bar: 0 to 10% starting the engine, 10 to 95% pages, then saving.
   const bar = (f) => ui.bar(f);
-  await callWorker({ type: 'init' }, [], (f, stage) => { bar(0.1 * f); ui.status(`${stage} ${Math.round(100 * f)}%`); });
+  const { device } = await callWorker({ type: 'init', device: opts.gpu ? 'auto' : 'cpu' }, [], (f, stage) => { bar(0.1 * f); ui.status(`${stage} ${Math.round(100 * f)}%`); });
+  let on = device === 'gpu' ? 'graphics card' : 'processor';
   bar(0.1);
   let done = 0, skipped = 0, wordsTotal = 0;
 
@@ -146,10 +147,12 @@ async function processFile(file, opts, ui) {
       skipped++;
     } else {
       const bitmap = await createImageBitmap(cur.canvas);
-      const { lines } = await callWorker({ type: 'page', bitmap, detScale: DET_SCALE }, [bitmap], (f, stage) => {
+      const res = await callWorker({ type: 'page', bitmap, detScale: DET_SCALE }, [bitmap], (f, stage) => {
         bar(0.1 + 0.85 * (done + f) / n);
-        ui.status(`Page ${i} of ${n}: ${stage.toLowerCase()} ${Math.round(100 * f)}%`);
+        ui.status(`Page ${i} of ${n}: ${stage.toLowerCase()} ${Math.round(100 * f)}% on ${on}`);
       });
+      const { lines } = res;
+      on = res.device === 'gpu' ? 'graphics card' : 'processor';
       const pdfPage = pages[i - 1];
       pdfPage.node.normalize();
       const fontKey = pdfPage.node.newFontDictionary(font.name, font.ref);
@@ -168,7 +171,7 @@ async function processFile(file, opts, ui) {
   bar(0.97);
   const saved = await out.save({ useObjectStreams: true });
   await pdf.destroy();
-  return { blob: new Blob([saved], { type: 'application/pdf' }), pages: n, skipped, words: wordsTotal };
+  return { blob: new Blob([saved], { type: 'application/pdf' }), pages: n, skipped, words: wordsTotal, on };
 }
 
 // ---------------------------------------------------------------- interface
@@ -177,11 +180,44 @@ const $ = (s) => document.querySelector(s);
 const drop = $('#drop');
 const input = $('#file');
 const list = $('#jobs');
-const queue = [];
+const jobs = [];       // every file added this session, in order
 let busy = false;
+let paused = false;
 
 function readOptions() {
-  return { dpi: +$('#dpi').value, skipText: $('#skip').checked };
+  return { dpi: +$('#dpi').value, skipText: $('#skip').checked, gpu: $('#gpu').checked };
+}
+
+const counts = () => ({
+  total: jobs.length,
+  done: jobs.filter(j => j.status === 'done').length,
+  fresh: jobs.filter(j => j.status === 'done' && !j.downloaded).length,
+  waiting: jobs.filter(j => j.status === 'waiting').length,
+  running: jobs.filter(j => j.status === 'running').length,
+  failed: jobs.filter(j => j.status === 'failed').length,
+});
+
+// Batch panel: overall progress and bulk actions.
+function refresh() {
+  const c = counts();
+  $('#batch').hidden = c.total === 0;
+  const parts = [`${c.done} of ${c.total} done`];
+  if (c.running) parts.push(paused ? 'finishing current file, then pausing' : 'working');
+  if (c.waiting) parts.push(`${c.waiting} waiting${paused ? ' (paused)' : ''}`);
+  if (c.failed) parts.push(`${c.failed} failed`);
+  $('#batch-summary').textContent = parts.join(', ');
+  const running = jobs.find(j => j.status === 'running');
+  const overall = c.total ? (c.done + c.failed + (running ? running.fraction || 0 : 0)) / c.total : 0;
+  $('#batch-bar').style.width = `${(100 * overall).toFixed(1)}%`;
+  const zip = $('#zip');
+  zip.disabled = c.fresh === 0;
+  zip.textContent = c.fresh === 0
+    ? (c.done ? 'All finished files downloaded' : 'Download finished files')
+    : `Download ${c.fresh} ${c.done > c.fresh ? 'new ' : ''}finished file${c.fresh === 1 ? '' : 's'} (ZIP)`;
+  const pause = $('#pause');
+  pause.hidden = !(c.waiting || c.running);
+  pause.textContent = paused ? 'Resume' : 'Pause';
+  $('#clear').hidden = !(c.done || c.failed);
 }
 
 function addFiles(files) {
@@ -189,51 +225,77 @@ function addFiles(files) {
     if (f.type !== 'application/pdf' && !/\.pdf$/i.test(f.name)) continue;
     const li = document.createElement('li');
     li.className = 'job';
-    li.innerHTML = `<div class="job-head"><span class="name"></span><span class="state">Waiting</span></div>
+    li.innerHTML = `<div class="job-head"><span class="name"></span><span class="state">Waiting</span>
+      <button class="remove" type="button" aria-label="Remove from queue" title="Remove from queue">&times;</button></div>
       <div class="bar"><div></div></div><div class="result"></div>`;
     li.querySelector('.name').textContent = f.name;
-    list.prepend(li);
-    queue.push({ file: f, li, opts: readOptions() });
+    const job = { file: f, li, opts: readOptions(), status: 'waiting', fraction: 0, downloaded: false };
+    li.querySelector('.remove').addEventListener('click', () => {
+      if (job.status !== 'waiting') return;
+      jobs.splice(jobs.indexOf(job), 1);
+      li.remove();
+      refresh();
+    });
+    list.append(li);
+    jobs.push(job);
   }
+  refresh();
   pump();
+}
+
+function markDownloaded(job) {
+  job.downloaded = true;
+  job.li.classList.add('downloaded');
+  refresh();
 }
 
 async function pump() {
   if (busy) return;
   busy = true;
-  while (queue.length) {
-    const { file, li, opts } = queue.shift();
+  for (;;) {
+    const job = paused ? null : jobs.find(j => j.status === 'waiting');
+    if (!job) break;
+    const { file, li, opts } = job;
     const state = li.querySelector('.state');
     const bar = li.querySelector('.bar > div');
     const result = li.querySelector('.result');
+    job.status = 'running';
     li.classList.add('running');
+    refresh();
     const t0 = performance.now();
     let label = 'Starting';
-    const timer = setInterval(() => { state.textContent = `${label} (${Math.round((performance.now() - t0) / 1000)} s)`; }, 1000);
+    const show = () => { state.textContent = `${label} (${Math.round((performance.now() - t0) / 1000)} s)`; };
+    const timer = setInterval(show, 1000);
     try {
       const r = await processFile(file, opts, {
-        status: (s) => { label = s; state.textContent = `${label} (${Math.round((performance.now() - t0) / 1000)} s)`; },
-        bar: (f) => { bar.style.width = `${(100 * f).toFixed(1)}%`; },
+        status: (s) => { label = s; show(); },
+        bar: (f) => { bar.style.width = `${(100 * f).toFixed(1)}%`; job.fraction = f; refresh(); },
       });
       clearInterval(timer);
       bar.style.width = '100%';
       const secs = ((performance.now() - t0) / 1000).toFixed(0);
-      const name = file.name.replace(/\.pdf$/i, '') + '_searchable.pdf';
-      const url = URL.createObjectURL(r.blob);
+      job.name = file.name.replace(/\.pdf$/i, '') + '_searchable.pdf';
+      job.blob = r.blob;
+      job.status = 'done';
       state.textContent = `Done in ${secs} s`;
       const a = document.createElement('a');
-      a.href = url; a.download = name; a.className = 'download';
-      a.textContent = `Download ${name}`;
-      const note = document.createElement('p');
+      a.href = URL.createObjectURL(r.blob); a.download = job.name; a.className = 'download';
+      a.textContent = 'Download';
+      a.addEventListener('click', () => markDownloaded(job));
+      const note = document.createElement('span');
       note.className = 'note';
       note.textContent = `${r.pages} page${r.pages === 1 ? '' : 's'}, ${r.words.toLocaleString()} words added`
         + (r.skipped ? `, ${r.skipped} page${r.skipped === 1 ? '' : 's'} already searchable and left as is` : '')
-        + `. ${(r.blob.size / 1048576).toFixed(1)} MB.`;
-      result.append(a, note);
+        + `, ${(r.blob.size / 1048576).toFixed(1)} MB, read on the ${r.on}`;
+      const tick = document.createElement('span');
+      tick.className = 'tick';
+      tick.textContent = 'Downloaded';
+      result.append(a, note, tick);
       li.classList.add('ok');
     } catch (err) {
       console.error(err);
       clearInterval(timer);
+      job.status = 'failed';
       state.textContent = 'Failed';
       result.textContent = /password/i.test(err && err.message)
         ? 'This PDF is password protected. Remove the password and try again.'
@@ -242,9 +304,61 @@ async function pump() {
     }
     clearInterval(timer);
     li.classList.remove('running');
+    refresh();
   }
   busy = false;
+  refresh();
 }
+
+// One ZIP with every finished file not downloaded yet. PDFs are already
+// compressed, so they are stored as is, which is fast.
+async function downloadZip() {
+  const fresh = jobs.filter(j => j.status === 'done' && !j.downloaded);
+  if (!fresh.length) return;
+  const btn = $('#zip');
+  btn.disabled = true;
+  btn.textContent = 'Preparing ZIP';
+  try {
+    const { zipSync } = await import('./vendor/fflate/fflate.mjs');
+    const entries = {};
+    const used = new Set();
+    for (const j of fresh) {
+      let name = j.name;
+      for (let k = 2; used.has(name.toLowerCase()); k++) name = j.name.replace(/\.pdf$/i, ` (${k}).pdf`);
+      used.add(name.toLowerCase());
+      entries[name] = [new Uint8Array(await j.blob.arrayBuffer()), { level: 0 }];
+    }
+    const zipped = zipSync(entries);
+    const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ').replace(':', '.');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([zipped], { type: 'application/zip' }));
+    a.download = `searchable PDFs ${stamp}.zip`;
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    fresh.forEach(markDownloaded);
+  } finally {
+    refresh();
+  }
+}
+
+$('#zip').addEventListener('click', downloadZip);
+$('#pause').addEventListener('click', () => { paused = !paused; refresh(); if (!paused) pump(); });
+$('#clear').addEventListener('click', () => {
+  for (const j of jobs.filter(j => j.status === 'done' || j.status === 'failed')) {
+    if (j.status === 'done' && !j.downloaded && !confirm(`${j.name} has not been downloaded yet. Clear it anyway?`)) continue;
+    const a = j.li.querySelector('a.download');
+    if (a) URL.revokeObjectURL(a.href);
+    j.li.remove();
+    jobs.splice(jobs.indexOf(j), 1);
+  }
+  refresh();
+});
+
+// Warn before closing the tab while work is queued or results are not saved.
+window.addEventListener('beforeunload', (e) => {
+  const c = counts();
+  if (c.waiting || c.running || c.fresh) { e.preventDefault(); e.returnValue = ''; }
+});
 
 drop.addEventListener('click', () => input.click());
 drop.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); input.click(); } });
@@ -256,4 +370,4 @@ window.addEventListener('dragover', (e) => e.preventDefault());
 window.addEventListener('drop', (e) => e.preventDefault());
 
 // Exposed for automated testing.
-window.__ocr = { processFile, readOptions };
+window.__ocr = { processFile, readOptions, jobs };

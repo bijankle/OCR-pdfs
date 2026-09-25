@@ -22,6 +22,19 @@ browser tab, so the site is just static files on GitHub Pages.
 Text that is already real text in the PDF is kept, and OCR words that land on
 it are dropped so nothing is doubled.
 
+## Batches and speed
+
+Drop in as many PDFs as you like. They are processed one after another, and
+at any point the batch panel can download every finished file that has not
+been downloaded yet as one ZIP, so a batch can be collected in parts. Waiting
+files can be removed, and the queue can be paused and resumed.
+
+When the browser supports WebGPU (current Chrome and Edge), the detection and
+recognition models run on the graphics card. At startup the app reads a small
+test image on both the graphics card and the processor and only uses the
+graphics card if the results match; if the graphics card fails mid job, the
+page is redone on the processor.
+
 ## Why PaddleOCR and not Tesseract
 
 Measured with the test bench used during development (word level F1 score):
@@ -48,7 +61,7 @@ PP-OCRv6 medium model was also tried. It was 6 times slower and mixed up O and
 | `paddle.js` | The PaddleOCR pipeline (detection, orientation, recognition) |
 | `ocr-worker.js` | Runs the pipeline in a background thread so the page never freezes |
 | `models/` | PP-OCRv5 mobile detection, English PP-OCRv5 mobile recognition, text line orientation model |
-| `vendor/` | ONNX Runtime Web, pdf.js (legacy build for older browsers), pdf-lib |
+| `vendor/` | ONNX Runtime Web (WebGPU and processor build), pdf.js (legacy build for older browsers), pdf-lib, fflate for ZIP downloads |
 | `coi-serviceworker.min.js` | Lets GitHub Pages run the engine on all CPU cores |
 
 ## Publishing
@@ -58,4 +71,4 @@ Settings, Pages, Source: "Deploy from a branch", branch `main`, folder `/ (root)
 ## Licenses
 
 PaddleOCR models: Apache 2.0. ONNX Runtime Web: MIT. pdf.js: Apache 2.0.
-pdf-lib: MIT. coi-serviceworker: MIT.
+pdf-lib: MIT. fflate: MIT. coi-serviceworker: MIT.

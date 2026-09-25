@@ -8,7 +8,7 @@
 //
 // All geometry is in pixels of the source canvas passed to recognizePage().
 
-import * as ort from './vendor/ort/ort.wasm.min.mjs';
+import * as ort from './vendor/ort/ort.min.mjs';
 
 ort.env.wasm.wasmPaths = new URL('./vendor/ort/', import.meta.url).href;
 ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(8, navigator.hardwareConcurrency || 4) : 1;
@@ -24,12 +24,12 @@ const REC = { height: 48, batch: 8, maxWidth: 3200 };
 
 // ------------------------------------------------------------------ loading
 
-export async function createEngine(setName = 'fast', { onStatus = () => {}, providers } = {}) {
+// device: 'auto' uses the graphics card (WebGPU) when it is available and
+// gives the same answers as the processor on a test image, otherwise 'cpu'.
+export async function createEngine(setName = 'fast', { onStatus = () => {}, device = 'auto' } = {}) {
   const set = typeof setName === 'string' ? MODEL_SETS[setName] : setName;
-  const ep = providers || ['wasm'];
-  const opts = { executionProviders: ep, graphOptimizationLevel: 'all' };
   // Download the models ourselves so progress can be shown (cached after the first visit).
-  const WASM = new URL('./vendor/ort/ort-wasm-simd-threaded.wasm', import.meta.url).href;
+  const WASM = new URL('./vendor/ort/ort-wasm-simd-threaded.jsep.wasm', import.meta.url).href;
   const files = [MODELS + set.det, MODELS + set.rec, MODELS + (set.cls || 'PP-LCNet_x0_25_textline_ori.onnx'), WASM];
   const got = files.map(() => 0), total = files.map(() => 0);
   const report = () => {
@@ -59,14 +59,56 @@ export async function createEngine(setName = 'fast', { onStatus = () => {}, prov
     fetch(MODELS + set.dict).then(r => { if (!r.ok) throw new Error('dictionary ' + r.status); return r.text(); }),
   ]);
   ort.env.wasm.wasmBinary = wasmBytes.buffer;
-  onStatus('Starting OCR engine', 1);
-  const det = await ort.InferenceSession.create(detBytes, opts);
-  const rec = await ort.InferenceSession.create(recBytes, opts);
-  const cls = await ort.InferenceSession.create(clsBytes, opts);
   // Index 0 is the CTC blank. Some models add a space after the dictionary,
   // which recognize() appends once it sees the model's class count.
   const dict = [''].concat(dictText.replace(/\r/g, '').split('\n').filter(c => c !== ''));
-  return { det, rec, cls, dict, set: setName };
+
+  const build = async (ep) => {
+    const opts = { executionProviders: [ep], graphOptimizationLevel: 'all' };
+    return {
+      det: await ort.InferenceSession.create(detBytes, opts),
+      rec: await ort.InferenceSession.create(recBytes, opts),
+      // The orientation model is tiny, the processor handles it best.
+      cls: await ort.InferenceSession.create(clsBytes, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }),
+      dict, set: setName, device: ep === 'webgpu' ? 'gpu' : 'cpu',
+    };
+  };
+  onStatus('Starting OCR engine', 1);
+  const cpu = await build('wasm');
+  cpu.fallback = cpu;
+  if (device === 'cpu' || !(await hasWebGPU())) return cpu;
+
+  onStatus('Checking graphics card', 1);
+  try {
+    const gpu = await build('webgpu');
+    gpu.fallback = cpu;
+    const test = testImage();
+    const want = (await recognizePage(cpu, test, { detScale: 1 })).map(l => l.text).join('|');
+    const have = (await recognizePage(gpu, test, { detScale: 1 })).map(l => l.text).join('|');
+    if (want && want === have) return gpu;
+    console.warn('Graphics card results differ from processor, using processor.', { want, have });
+  } catch (err) {
+    console.warn('Graphics card not usable, using processor.', err);
+  }
+  return cpu;
+}
+
+async function hasWebGPU() {
+  try { return !!(navigator.gpu && await navigator.gpu.requestAdapter()); } catch { return false; }
+}
+
+// A small drawing like image with horizontal and vertical text.
+function testImage() {
+  const c = canvas(640, 320);
+  const x = c.getContext('2d');
+  x.fillStyle = '#fff'; x.fillRect(0, 0, 640, 320); x.fillStyle = '#000';
+  x.font = '28px sans-serif';
+  x.fillText('PUMP HOUSING COVER', 60, 60);
+  x.fillText('14-0229-IA-MSG3-40', 60, 120);
+  x.font = '22px sans-serif';
+  x.fillText('SCALE 1:2  SHEET 1 OF 3', 60, 180);
+  x.save(); x.translate(560, 290); x.rotate(-Math.PI / 2); x.fillText('F13-11591', 0, 0); x.restore();
+  return c;
 }
 
 // ------------------------------------------------------------------ helpers
@@ -362,7 +404,8 @@ async function recognize(engine, src, rects, report = () => {}) {
   const results = new Array(rects.length);
   for (let s = 0; s < items.length; s += REC.batch) {
     const part = items.slice(s, s + REC.batch);
-    const Wp = Math.ceil(Math.max(...part.map(p => p.W)) / 8) * 8;
+    // Widths rounded up to 64 px steps so the graphics card can reuse compiled kernels.
+    const Wp = Math.ceil(Math.max(...part.map(p => p.W)) / 64) * 64;
     const data = new Float32Array(part.length * 3 * H * Wp);
     part.forEach((p, i) => toTensor(cropRect(src, p.r, p.W, H), p.W, H, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], data, i * 3 * H * Wp, Wp));
     const res = await engine.rec.run({ [engine.rec.inputNames[0]]: new ort.Tensor('float32', data, [part.length, 3, H, Wp]) });

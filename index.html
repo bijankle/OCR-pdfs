@@ -29,18 +29,32 @@
     </div>
     <label class="check"><input type="checkbox" id="skip" checked>
       Skip pages that are already fully searchable</label>
+    <label class="check"><input type="checkbox" id="gpu" checked>
+      Use the graphics card when available (faster)</label>
   </section>
 
   <div id="drop" class="drop" tabindex="0" role="button" aria-label="Choose PDF files">
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0-4 4m4-4 4 4M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    <p><strong>Drop PDFs here</strong> or click to choose</p>
+    <p><strong>Drop PDFs here</strong> or click to choose. Add as many as you like.</p>
     <input type="file" id="file" accept="application/pdf,.pdf" multiple hidden>
   </div>
+
+  <section id="batch" class="batch" hidden aria-live="polite">
+    <div class="batch-head">
+      <span id="batch-summary"></span>
+    </div>
+    <div class="bar"><div id="batch-bar"></div></div>
+    <div class="batch-actions">
+      <button id="zip" class="primary" type="button" disabled>Download finished files</button>
+      <button id="pause" type="button">Pause</button>
+      <button id="clear" type="button">Clear finished</button>
+    </div>
+  </section>
 
   <ol id="jobs" class="jobs"></ol>
 
   <footer>
-    <p>OCR by PaddleOCR PP-OCRv5 running on ONNX Runtime Web. The first run downloads about 30 MB of engine and model files, after that your browser caches them.</p>
+    <p>OCR by PaddleOCR PP-OCRv5 running on ONNX Runtime Web. The first run downloads about 45 MB of engine and model files, after that your browser caches them.</p>
   </footer>
 </main>
 </body>
